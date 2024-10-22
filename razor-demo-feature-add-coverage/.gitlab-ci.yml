@@ -1,0 +1,138 @@
+stages:
+  - code
+  - build
+  - test
+  - release
+  - deploy
+
+variables:
+  PROJECT_NAME: "razor-demo"
+  APP_NAME: "razor"
+  APP_URL: "razor-demo.got.co.th"
+  APP_PORT: 8080
+  TEST_PORT: 18080
+  TEST_HOST: "10.10.70.56"
+  IMAGE_TAG: "$CI_PROJECT_NAME"
+  IMAGE_GITLAB: "$CI_REGISTRY_IMAGE:$CI_COMMIT_BRANCH.$CI_COMMIT_SHORT_SHA"
+  IMAGE_GITLAB_LAST: "$CI_REGISTRY_IMAGE:latest"
+  CLUSTER_NAME: "tkc-02-minimal"
+
+include:
+  - project: 'got-infra/sonar/template-sonar'
+    ref: main
+    file: 
+      - 'stages/ScanDotNet.yaml'
+
+# Build app
+build_app:
+  stage: build
+  tags:
+    - tkg-sonar-scanner-shell
+  script:
+    - dotnet build
+  rules:
+    - if: $CI_COMMIT_BRANCH =~ /^feature\/.*/
+    - if: $CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "uat"
+
+# Build docker
+build_docker:
+  stage: build
+  tags:
+    - tkg-gitlab-runner-shell
+  script:
+    - echo "Start Job $CI_JOB_NAME"
+    - echo $IMAGE_TAG
+    - docker build -t "$IMAGE_TAG" .
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "uat"
+
+# Test connection in docker container
+test_app:
+  stage: test
+  tags:
+    - tkg-gitlab-runner-shell
+  dependencies:
+    - build_docker
+  script:
+    - |
+      echo "Start Job $CI_JOB_NAME"	
+      # Run Docker
+      docker stop $CI_PROJECT_NAME || true && docker rm $CI_PROJECT_NAME || true 
+    - |
+      docker run -d -it --name $CI_PROJECT_NAME -p $TEST_PORT:$APP_PORT $IMAGE_TAG
+      echo "----------- Show Container are running on Docker"
+      sleep 3
+      docker container ls --filter expose=$TEST_PORT/tcp \
+        --format "table {{.ID}}\t{{.Names}}\t{{.Status}}\t{{.Ports}}" 
+      docker port $CI_PROJECT_NAME | awk '{print $3}' | \
+        awk '{split($0,a,":"); print a[2]}' | head -1
+      docker port $CI_PROJECT_NAME
+      echo "Test Container Port = $TEST_PORT"
+    - |
+      echo "----------- TEST Container Access to external network"
+      URL=https://www.google.com
+      docker exec $CI_PROJECT_NAME curl -Lks -w %{http_code} -o /dev/null $URL > test_result.txt
+      code=`cat test_result.txt`
+      case $code in 
+        200) echo "$URL 200 Ok";;
+        405) echo "$URL 405 Ok";;
+        *)   echo "$URL $code Error" && exit 1;;
+      esac
+  after_script:
+    - |
+      echo "-------------Docker Log------------"
+      docker logs $CI_PROJECT_NAME
+      echo "Finish Testing"
+      echo "http://$TEST_HOST:$TEST_PORT"
+      echo "Completed"
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "uat"
+
+# Release App
+push_app:
+  stage: release
+  tags:
+    - tkg-gitlab-runner-shell
+  dependencies:
+    - build_docker
+  script:
+    - echo "Start Job $CI_JOB_NAME"	
+    - ping -c 3 $CI_REGISTRY
+    - docker logout
+    - echo "Login to gitlab registry wiht user gitlab-ci-token and password $CI_JOB_TOKEN"
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+    - echo $IMAGE_TAG $IMAGE_GITLAB
+    - docker image tag $IMAGE_TAG $IMAGE_GITLAB
+    - docker push $IMAGE_GITLAB
+    - docker image tag $IMAGE_TAG $IMAGE_GITLAB_LAST
+    - docker push $IMAGE_GITLAB_LAST
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "uat"
+  retry: 1
+
+# Deploy to Kubernetes
+deploy_kube:
+  stage: deploy
+  tags:
+    - tkg-gitlab-runner-shell
+  before_script:
+    - docker logout
+    - kubectl vsphere login --vsphere-username Administrator@vsphere.local --server=https://10.10.112.11 --tanzu-kubernetes-cluster-namespace dev --tanzu-kubernetes-cluster-name $CLUSTER_NAME --insecure-skip-tls-verify
+    - kubectl config use-context $CLUSTER_NAME
+    - kubectl -n $PROJECT_NAME create secret docker-registry regcred --docker-server=$CI_REGISTRY --docker-username=$GITLAB_TOKEN_USER --docker-password=$GITLAB_TOKEN_PASSWORD --dry-run=client -o yaml | kubectl apply -f -
+    - kubectl -n $PROJECT_NAME create secret docker-registry registry-gitlab --docker-server=$CI_REGISTRY  --docker-username=$CI_REGISTRY_USER --docker-password=$CI_REGISTRY_PASSWORD --dry-run=client -o yaml | kubectl apply -f -
+    - kubectl -n $PROJECT_NAME get secret -o wide
+  script:
+    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+    - echo $APP_NAME
+    - echo $APP_URL
+    - echo $PROJECT_NAME
+    - echo $IMAGE_GITLAB
+    - sed -i 's|$APP_NAME|'"$APP_NAME"'|g' kube-deployment.yaml
+    - sed -i 's|$PROJECT_NAME|'"$PROJECT_NAME"'|g' kube-deployment.yaml
+    - sed -i 's|$IMAGE_GITLAB|'"$IMAGE_GITLAB"'|g' kube-deployment.yaml
+    - sed -i 's|$APP_URL|'"$APP_URL"'|g' kube-deployment.yaml
+    - cat kube-deployment.yaml
+    - kubectl -n $PROJECT_NAME apply -f ./kube-deployment.yaml
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "uat"

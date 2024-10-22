@@ -1,0 +1,111 @@
+---
+# Source: template/templates/namespace.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: "$PROJECT_NAME"
+---
+# Source: template/templates/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: svc-$APP_NAME
+  namespace: "$PROJECT_NAME"
+  labels:
+    app: $APP_NAME
+    tags.datadoghq.com/env: prod
+    tags.datadoghq.com/service: $APP_NAME
+    tags.datadoghq.com/version: "latest"
+spec:
+  type: LoadBalancer
+  selector:
+    app: "$APP_NAME"
+  ports:
+    - name: http
+      protocol: TCP
+      port: 80
+      targetPort: 8080
+---
+# Source: template/templates/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: "$APP_NAME"
+  namespace: "$PROJECT_NAME" 
+  labels:
+    app: $APP_NAME
+    tags.datadoghq.com/env: prod
+    tags.datadoghq.com/service: $APP_NAME
+    tags.datadoghq.com/version: "latest"
+spec:
+  revisionHistoryLimit: 0
+  replicas: 1
+  selector:
+    matchLabels:
+      app: "$APP_NAME"
+  template:
+    metadata:
+      labels:
+        app: $APP_NAME
+        tags.datadoghq.com/env: prod
+        tags.datadoghq.com/service: $APP_NAME
+        tags.datadoghq.com/version: "latest"
+    spec:
+      imagePullSecrets:
+        - name: "regcred"
+        - name: "registry-gitlab"
+      automountServiceAccountToken: false
+      containers:
+        - name: "$APP_NAME"
+          image: "$IMAGE_GITLAB"
+          imagePullPolicy: "IfNotPresent"
+          ports:
+            - containerPort: 8080
+          resources:
+            requests:
+              memory: 256Mi
+              cpu: 100m
+            limits:
+              memory: 512Mi
+              ephemeral-storage: "2Gi"
+          env:
+            - name: "DD_LOGS_INJECTION"
+              value: 'true'
+            - name: "DD_SERVICE"
+              value: '$APP_NAME'
+            - name: "DD_AGENT_HOST"
+              value: 'datadog-agent.datadog'
+            - name: "DD_ENV"
+              value: 'prod'
+            - name: "DD_VERSION"
+              value: 'latest'
+---
+# Source: template/templates/ingress.yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ing-$APP_NAME
+  namespace: "$PROJECT_NAME"
+  labels:
+    app: $APP_NAME
+    tags.datadoghq.com/env: prod
+    tags.datadoghq.com/service: $APP_NAME
+    tags.datadoghq.com/version: "latest"
+  annotations:
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - "$APP_URL"
+      secretName: got
+  rules:
+    - host: $APP_URL
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: svc-$APP_NAME
+                port: 
+                  number: 80
